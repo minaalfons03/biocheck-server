@@ -1,0 +1,16 @@
+[phases.setup]
+nixPkgs = [
+  "xorg.libX11",
+  "xorg.libXext", 
+  "xorg.libXrender",
+  "xorg.libxcb",
+  "libGL",
+  "libGLU",
+  "glib",
+  "cmake",
+  "gcc",
+  "pkg-config"
+]
+
+[phases.build]
+cmds = ["pip install --upgrade pip setuptools wheel", "pip install -r requirements.txt"]
