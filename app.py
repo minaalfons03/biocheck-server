@@ -2,25 +2,22 @@ import os
 import io
 import base64
 import numpy as np
-
-# Force dlib to run without display
-os.environ["DLIB_USE_CUDA"] = "0"
-os.environ["DISPLAY"] = ""
-
-import face_recognition
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from PIL import Image
 import firebase_admin
 from firebase_admin import credentials, db as firebase_db
+from deepface import DeepFace
+import tempfile
 
 app = Flask(__name__)
 CORS(app)
 
 # ── Firebase ──────────────────────────────────────────────────────────
 firebase_creds_json = os.environ.get("FIREBASE_CREDENTIALS")
+firebase_ref = None
 if firebase_creds_json:
-    import json, tempfile
+    import json
     creds_dict = json.loads(firebase_creds_json)
     with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
         json.dump(creds_dict, f)
@@ -32,11 +29,13 @@ if firebase_creds_json:
     firebase_ref = firebase_db.reference('/')
     print("✓ Firebase connected")
 else:
-    firebase_ref = None
-    print("⚠ No FIREBASE_CREDENTIALS — Firebase writes disabled")
+    print("⚠ No FIREBASE_CREDENTIALS set")
 
 # ── In-memory face store ──────────────────────────────────────────────
-known_faces = {}  # { "name": np.array(encoding) }
+# { "name": "path/to/saved/image.jpg" }
+known_faces = {}
+FACES_DIR = "/tmp/known_faces"
+os.makedirs(FACES_DIR, exist_ok=True)
 
 # ── Routes ────────────────────────────────────────────────────────────
 @app.route("/", methods=["GET"])
@@ -49,15 +48,19 @@ def register_face():
     name = data.get("name", "").strip()
     image_b64 = data.get("image", "")
     if not name or not image_b64:
-        return jsonify({"error": "name and image are required"}), 400
+        return jsonify({"error": "name and image required"}), 400
     try:
         img_bytes = base64.b64decode(image_b64)
         img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-        img_np = np.array(img)
-        encodings = face_recognition.face_encodings(img_np)
-        if not encodings:
-            return jsonify({"error": "No face found in the image"}), 422
-        known_faces[name] = encodings[0]
+        # Save image to disk so DeepFace can use it
+        img_path = os.path.join(FACES_DIR, f"{name}.jpg")
+        img.save(img_path)
+        # Verify a face exists in the image
+        result = DeepFace.extract_faces(img_path, detector_backend="opencv", enforce_detection=True)
+        if not result:
+            os.remove(img_path)
+            return jsonify({"error": "No face found in image"}), 422
+        known_faces[name] = img_path
         print(f"✓ Registered: {name}")
         return jsonify({"success": True, "name": name, "total": len(known_faces)})
     except Exception as e:
@@ -68,31 +71,51 @@ def recognise_face():
     data = request.get_json()
     image_b64 = data.get("image", "")
     if not image_b64:
-        return jsonify({"error": "image is required"}), 400
+        return jsonify({"error": "image required"}), 400
+    if not known_faces:
+        return jsonify({"name": None, "faces_found": 0, "message": "No faces registered yet"})
     try:
         img_bytes = base64.b64decode(image_b64)
         img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-        img_np = np.array(img)
-        face_locations = face_recognition.face_locations(img_np)
-        face_encodings = face_recognition.face_encodings(img_np, face_locations)
-        if not face_encodings:
-            return jsonify({"name": None, "faces_found": 0, "message": "No face detected"})
+        # Save snapshot temporarily
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+            img.save(tmp.name)
+            tmp_path = tmp.name
+        # Check each known face
         result_name = "Unknown"
         best_distance = 1.0
-        for encoding in face_encodings:
-            if not known_faces:
-                break
-            known_names = list(known_faces.keys())
-            known_encodings = list(known_faces.values())
-            distances = face_recognition.face_distance(known_encodings, encoding)
-            best_idx = int(np.argmin(distances))
-            dist = float(distances[best_idx])
-            if dist < 0.50 and dist < best_distance:
-                best_distance = dist
-                result_name = known_names[best_idx]
+        faces_found = 0
+        try:
+            faces = DeepFace.extract_faces(tmp_path, detector_backend="opencv", enforce_detection=False)
+            faces_found = len([f for f in faces if f.get("confidence", 0) > 0.5])
+        except:
+            faces_found = 0
+
+        if faces_found > 0:
+            for name, face_path in known_faces.items():
+                try:
+                    verify = DeepFace.verify(
+                        tmp_path, face_path,
+                        model_name="Facenet",
+                        detector_backend="opencv",
+                        enforce_detection=False
+                    )
+                    dist = verify.get("distance", 1.0)
+                    if verify.get("verified") and dist < best_distance:
+                        best_distance = dist
+                        result_name = name
+                except Exception as e:
+                    print(f"Verify error for {name}: {e}")
+                    continue
+
+        os.unlink(tmp_path)
+
         if result_name != "Unknown" and firebase_ref:
             firebase_ref.child("current_user").set(result_name)
-        return jsonify({"name": result_name, "confidence": round(1 - best_distance, 3), "faces_found": len(face_encodings)})
+
+        confidence = round(max(0, 1 - best_distance), 3)
+        return jsonify({"name": result_name, "confidence": confidence, "faces_found": faces_found})
+
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -103,6 +126,10 @@ def list_faces():
 @app.route("/faces/<name>", methods=["DELETE"])
 def delete_face(name):
     if name in known_faces:
+        try:
+            os.remove(known_faces[name])
+        except:
+            pass
         del known_faces[name]
         return jsonify({"success": True, "deleted": name})
     return jsonify({"error": "Not found"}), 404
