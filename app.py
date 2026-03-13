@@ -9,30 +9,48 @@ import firebase_admin
 from firebase_admin import credentials, db as firebase_db
 from deepface import DeepFace
 import tempfile
+import json
 
 app = Flask(__name__)
 CORS(app)
 
 # ── Firebase ──────────────────────────────────────────────────────────
-firebase_creds_json = os.environ.get("FIREBASE_CREDENTIALS")
 firebase_ref = None
-if firebase_creds_json:
-    import json
-    creds_dict = json.loads(firebase_creds_json)
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
-        json.dump(creds_dict, f)
-        creds_path = f.name
-    cred = credentials.Certificate(creds_path)
-    firebase_admin.initialize_app(cred, {
-        'databaseURL': 'https://biocheckstation-default-rtdb.firebaseio.com/'
-    })
-    firebase_ref = firebase_db.reference('/')
-    print("✓ Firebase connected")
-else:
-    print("⚠ No FIREBASE_CREDENTIALS set")
+
+def init_firebase():
+    global firebase_ref
+    try:
+        # Try reading as a single JSON string first
+        creds_json = os.environ.get("FIREBASE_CREDENTIALS", "")
+        if not creds_json:
+            print("⚠ FIREBASE_CREDENTIALS not set")
+            return
+
+        # Fix common issue: escaped newlines in private_key
+        creds_json = creds_json.replace('\\n', '\n')
+
+        creds_dict = json.loads(creds_json)
+
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+            json.dump(creds_dict, f)
+            creds_path = f.name
+
+        cred = credentials.Certificate(creds_path)
+        firebase_admin.initialize_app(cred, {
+            'databaseURL': 'https://biocheckstation-default-rtdb.firebaseio.com/'
+        })
+        firebase_ref = firebase_db.reference('/')
+        print("✓ Firebase connected successfully")
+
+    except json.JSONDecodeError as e:
+        print(f"✗ Firebase JSON parse error: {e}")
+        print("Check your FIREBASE_CREDENTIALS variable in Railway")
+    except Exception as e:
+        print(f"✗ Firebase init error: {e}")
+
+init_firebase()
 
 # ── In-memory face store ──────────────────────────────────────────────
-# { "name": "path/to/saved/image.jpg" }
 known_faces = {}
 FACES_DIR = "/tmp/known_faces"
 os.makedirs(FACES_DIR, exist_ok=True)
@@ -40,7 +58,11 @@ os.makedirs(FACES_DIR, exist_ok=True)
 # ── Routes ────────────────────────────────────────────────────────────
 @app.route("/", methods=["GET"])
 def health():
-    return jsonify({"status": "online", "registered_faces": list(known_faces.keys())})
+    return jsonify({
+        "status": "online",
+        "registered_faces": list(known_faces.keys()),
+        "firebase": "connected" if firebase_ref else "disconnected"
+    })
 
 @app.route("/register", methods=["POST"])
 def register_face():
@@ -52,10 +74,8 @@ def register_face():
     try:
         img_bytes = base64.b64decode(image_b64)
         img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-        # Save image to disk so DeepFace can use it
         img_path = os.path.join(FACES_DIR, f"{name}.jpg")
         img.save(img_path)
-        # Verify a face exists in the image
         result = DeepFace.extract_faces(img_path, detector_backend="opencv", enforce_detection=True)
         if not result:
             os.remove(img_path)
@@ -77,14 +97,14 @@ def recognise_face():
     try:
         img_bytes = base64.b64decode(image_b64)
         img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-        # Save snapshot temporarily
         with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
             img.save(tmp.name)
             tmp_path = tmp.name
-        # Check each known face
+
         result_name = "Unknown"
         best_distance = 1.0
         faces_found = 0
+
         try:
             faces = DeepFace.extract_faces(tmp_path, detector_backend="opencv", enforce_detection=False)
             faces_found = len([f for f in faces if f.get("confidence", 0) > 0.5])
@@ -112,9 +132,13 @@ def recognise_face():
 
         if result_name != "Unknown" and firebase_ref:
             firebase_ref.child("current_user").set(result_name)
+            print(f"✓ Firebase updated: {result_name}")
 
-        confidence = round(max(0, 1 - best_distance), 3)
-        return jsonify({"name": result_name, "confidence": confidence, "faces_found": faces_found})
+        return jsonify({
+            "name": result_name,
+            "confidence": round(max(0, 1 - best_distance), 3),
+            "faces_found": faces_found
+        })
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -123,7 +147,7 @@ def recognise_face():
 def list_faces():
     return jsonify({"faces": list(known_faces.keys())})
 
-@app.route("/faces/<name>", methods=["DELETE"])
+@app.route("/faces/<n>", methods=["DELETE"])
 def delete_face(name):
     if name in known_faces:
         try:
