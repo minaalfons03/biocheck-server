@@ -20,31 +20,23 @@ firebase_ref = None
 def init_firebase():
     global firebase_ref
     try:
-        # Try reading as a single JSON string first
         creds_json = os.environ.get("FIREBASE_CREDENTIALS", "")
         if not creds_json:
             print("⚠ FIREBASE_CREDENTIALS not set")
             return
-
-        # Fix common issue: escaped newlines in private_key
         creds_json = creds_json.replace('\\n', '\n')
-
         creds_dict = json.loads(creds_json)
-
         with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
             json.dump(creds_dict, f)
             creds_path = f.name
-
         cred = credentials.Certificate(creds_path)
         firebase_admin.initialize_app(cred, {
             'databaseURL': 'https://biocheckstation-default-rtdb.firebaseio.com/'
         })
         firebase_ref = firebase_db.reference('/')
         print("✓ Firebase connected successfully")
-
     except json.JSONDecodeError as e:
         print(f"✗ Firebase JSON parse error: {e}")
-        print("Check your FIREBASE_CREDENTIALS variable in Railway")
     except Exception as e:
         print(f"✗ Firebase init error: {e}")
 
@@ -107,8 +99,10 @@ def recognise_face():
 
         try:
             faces = DeepFace.extract_faces(tmp_path, detector_backend="opencv", enforce_detection=False)
-            faces_found = len([f for f in faces if f.get("confidence", 0) > 0.5])
-        except:
+            faces_found = len([f for f in faces if f.get("confidence", 0) > 0.3])
+            print(f"Faces detected: {faces_found}")
+        except Exception as e:
+            print(f"Face detection error: {e}")
             faces_found = 0
 
         if faces_found > 0:
@@ -116,19 +110,26 @@ def recognise_face():
                 try:
                     verify = DeepFace.verify(
                         tmp_path, face_path,
-                        model_name="Facenet",
+                        model_name="VGG-Face",
                         detector_backend="opencv",
-                        enforce_detection=False
+                        enforce_detection=False,
+                        distance_metric="cosine"
                     )
                     dist = verify.get("distance", 1.0)
-                    if verify.get("verified") and dist < best_distance:
+                    verified = verify.get("verified", False)
+                    print(f"  → {name}: distance={dist:.3f} verified={verified}")
+                    # Use verified flag from DeepFace directly
+                    if verified and dist < best_distance:
                         best_distance = dist
                         result_name = name
                 except Exception as e:
                     print(f"Verify error for {name}: {e}")
                     continue
 
-        os.unlink(tmp_path)
+        try:
+            os.unlink(tmp_path)
+        except:
+            pass
 
         if result_name != "Unknown" and firebase_ref:
             firebase_ref.child("current_user").set(result_name)
@@ -141,6 +142,7 @@ def recognise_face():
         })
 
     except Exception as e:
+        print(f"Recognise error: {e}")
         return jsonify({"error": str(e)}), 500
 
 @app.route("/faces", methods=["GET"])
