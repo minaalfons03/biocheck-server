@@ -9,9 +9,13 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
+
 COPY requirements.txt .
 RUN pip install --upgrade pip
 RUN pip install -r requirements.txt
+
+# FIX 3: Pre-download VGG-Face model at build time so first /recognise call doesn't time out
+RUN python -c "from deepface import DeepFace; DeepFace.build_model('VGG-Face')"
 
 COPY app.py .
 
