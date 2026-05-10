@@ -47,7 +47,7 @@ known_faces = {}
 FACES_DIR = "/tmp/known_faces"
 os.makedirs(FACES_DIR, exist_ok=True)
 
-# FIX 1: Reload any faces saved to disk on startup (survives redeploys within same session)
+# Reload faces saved to disk on startup
 for fname in os.listdir(FACES_DIR):
     if fname.endswith(".jpg"):
         n = fname[:-4]
@@ -73,12 +73,35 @@ def register_face():
     try:
         img_bytes = base64.b64decode(image_b64)
         img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+
+        # Resize large images to speed up processing
+        max_size = 640
+        if max(img.size) > max_size:
+            img.thumbnail((max_size, max_size), Image.LANCZOS)
+
         img_path = os.path.join(FACES_DIR, f"{name}.jpg")
-        img.save(img_path)
-        result = DeepFace.extract_faces(img_path, detector_backend="opencv", enforce_detection=True)
-        if not result:
+        img.save(img_path, quality=95)
+
+        # Try multiple detector backends for better detection
+        detected = False
+        for backend in ["opencv", "ssd", "mtcnn"]:
+            try:
+                result = DeepFace.extract_faces(
+                    img_path,
+                    detector_backend=backend,
+                    enforce_detection=True
+                )
+                if result:
+                    detected = True
+                    print(f"✓ Face detected with backend: {backend}")
+                    break
+            except Exception:
+                continue
+
+        if not detected:
             os.remove(img_path)
-            return jsonify({"error": "No face found in image"}), 422
+            return jsonify({"error": "No face found in image. Please use a clear, well-lit photo."}), 422
+
         known_faces[name] = img_path
         print(f"✓ Registered: {name}")
         return jsonify({"success": True, "name": name, "total": len(known_faces)})
@@ -96,41 +119,59 @@ def recognise_face():
     try:
         img_bytes = base64.b64decode(image_b64)
         img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+
+        # Resize for faster processing
+        max_size = 640
+        if max(img.size) > max_size:
+            img.thumbnail((max_size, max_size), Image.LANCZOS)
+
         with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
-            img.save(tmp.name)
+            img.save(tmp.name, quality=95)
             tmp_path = tmp.name
 
         result_name = "Unknown"
         best_distance = 1.0
         faces_found = 0
 
-        try:
-            faces = DeepFace.extract_faces(tmp_path, detector_backend="opencv", enforce_detection=False)
-            faces_found = len([f for f in faces if f.get("confidence", 0) > 0.3])
-            print(f"Faces detected: {faces_found}")
-        except Exception as e:
-            print(f"Face detection error: {e}")
-            faces_found = 0
+        # Try multiple backends to detect faces in the webcam frame
+        for backend in ["opencv", "ssd", "mtcnn"]:
+            try:
+                faces = DeepFace.extract_faces(
+                    tmp_path,
+                    detector_backend=backend,
+                    enforce_detection=False
+                )
+                found = [f for f in faces if f.get("confidence", 0) > 0.5]
+                if found:
+                    faces_found = len(found)
+                    print(f"Faces detected ({backend}): {faces_found}")
+                    break
+            except Exception as e:
+                print(f"Detection error ({backend}): {e}")
+                continue
 
         if faces_found > 0:
             for name, face_path in known_faces.items():
-                try:
-                    verify = DeepFace.verify(
-                        tmp_path, face_path,
-                        model_name="VGG-Face",
-                        detector_backend="opencv",
-                        enforce_detection=False,
-                        distance_metric="cosine"
-                    )
-                    dist = verify.get("distance", 1.0)
-                    verified = verify.get("verified", False)
-                    print(f"  → {name}: distance={dist:.3f} verified={verified}")
-                    if verified and dist < best_distance:
-                        best_distance = dist
-                        result_name = name
-                except Exception as e:
-                    print(f"Verify error for {name}: {e}")
-                    continue
+                for backend in ["opencv", "ssd", "mtcnn"]:
+                    try:
+                        verify = DeepFace.verify(
+                            tmp_path, face_path,
+                            model_name="VGG-Face",
+                            detector_backend=backend,
+                            enforce_detection=False,
+                            distance_metric="cosine"
+                        )
+                        dist = verify.get("distance", 1.0)
+                        print(f"  → {name} ({backend}): distance={dist:.3f}")
+
+                        # Relaxed threshold for better real-world matching
+                        if dist < 0.5 and dist < best_distance:
+                            best_distance = dist
+                            result_name = name
+                        break
+                    except Exception as e:
+                        print(f"Verify error for {name} ({backend}): {e}")
+                        continue
 
         try:
             os.unlink(tmp_path)
@@ -155,7 +196,6 @@ def recognise_face():
 def list_faces():
     return jsonify({"faces": list(known_faces.keys())})
 
-# FIX 2: Route parameter changed from <n> to <name> so Flask can pass it to the function
 @app.route("/faces/<name>", methods=["DELETE"])
 def delete_face(name):
     if name in known_faces:
