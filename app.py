@@ -47,6 +47,13 @@ known_faces = {}
 FACES_DIR = "/tmp/known_faces"
 os.makedirs(FACES_DIR, exist_ok=True)
 
+# FIX 1: Reload any faces saved to disk on startup (survives redeploys within same session)
+for fname in os.listdir(FACES_DIR):
+    if fname.endswith(".jpg"):
+        n = fname[:-4]
+        known_faces[n] = os.path.join(FACES_DIR, fname)
+        print(f"↺ Reloaded face: {n}")
+
 # ── Routes ────────────────────────────────────────────────────────────
 @app.route("/", methods=["GET"])
 def health():
@@ -118,7 +125,6 @@ def recognise_face():
                     dist = verify.get("distance", 1.0)
                     verified = verify.get("verified", False)
                     print(f"  → {name}: distance={dist:.3f} verified={verified}")
-                    # Use verified flag from DeepFace directly
                     if verified and dist < best_distance:
                         best_distance = dist
                         result_name = name
@@ -149,7 +155,8 @@ def recognise_face():
 def list_faces():
     return jsonify({"faces": list(known_faces.keys())})
 
-@app.route("/faces/<n>", methods=["DELETE"])
+# FIX 2: Route parameter changed from <n> to <name> so Flask can pass it to the function
+@app.route("/faces/<name>", methods=["DELETE"])
 def delete_face(name):
     if name in known_faces:
         try:
