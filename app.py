@@ -9,17 +9,16 @@ from flask_cors import CORS
 from PIL import Image
 import cv2
 import firebase_admin
-from firebase_admin import credentials, db as firebase_db, storage as firebase_storage
+from firebase_admin import credentials, db as firebase_db
 
 app = Flask(__name__)
 CORS(app)
 
 # ── Firebase ──────────────────────────────────────────────────────────
 firebase_ref = None
-storage_bucket = None
 
 def init_firebase():
-    global firebase_ref, storage_bucket
+    global firebase_ref
     try:
         creds_json = os.environ.get("FIREBASE_CREDENTIALS", "")
         if not creds_json:
@@ -32,12 +31,10 @@ def init_firebase():
             creds_path = f.name
         cred = credentials.Certificate(creds_path)
         firebase_admin.initialize_app(cred, {
-            'databaseURL': 'https://biocheckstation-default-rtdb.firebaseio.com/',
-            'storageBucket': 'biocheckstation.appspot.com'
+            'databaseURL': 'https://biocheckstation-default-rtdb.firebaseio.com/'
         })
         firebase_ref = firebase_db.reference('/')
-        storage_bucket = firebase_storage.bucket()
-        print("✓ Firebase connected (DB + Storage)")
+        print("✓ Firebase connected")
     except Exception as e:
         print(f"✗ Firebase init error: {e}")
 
@@ -100,51 +97,53 @@ def retrain():
         recognizer = cv2.face.LBPHFaceRecognizer_create()
         print("⚠ No faces to train on")
 
-def upload_face_to_firebase(name, img_path):
-    """Upload face image to Firebase Storage for persistence."""
-    if not storage_bucket:
+# ── Firebase face persistence (using Realtime DB, free tier) ──────────
+def save_face_to_firebase(name, img_path):
+    """Save face image as base64 in Firebase Realtime Database."""
+    if not firebase_ref:
         return
     try:
-        blob = storage_bucket.blob(f"faces/{name}.jpg")
-        blob.upload_from_filename(img_path, content_type='image/jpeg')
-        print(f"✓ Uploaded {name} to Firebase Storage")
+        with open(img_path, 'rb') as f:
+            b64 = base64.b64encode(f.read()).decode('utf-8')
+        firebase_ref.child('faces_data').child(name).set({'image': b64})
+        print(f"✓ Saved {name} to Firebase DB")
     except Exception as e:
-        print(f"⚠ Storage upload failed: {e}")
+        print(f"⚠ Firebase save failed: {e}")
 
-def download_all_faces_from_firebase():
-    """Download all face images from Firebase Storage on startup."""
-    if not storage_bucket:
-        print("⚠ No storage bucket — skipping face download")
+def load_faces_from_firebase():
+    """Download all face images from Firebase Realtime Database on startup."""
+    if not firebase_ref:
+        print("⚠ No Firebase — skipping face download")
         return
     try:
-        blobs = list(storage_bucket.list_blobs(prefix="faces/"))
-        if not blobs:
-            print("⚠ No faces in Firebase Storage yet")
+        data = firebase_ref.child('faces_data').get()
+        if not data:
+            print("⚠ No faces in Firebase DB yet")
             return
-        for blob in blobs:
-            fname = blob.name.replace("faces/", "")
-            if not fname.endswith(".jpg"):
+        for name, val in data.items():
+            if not val or 'image' not in val:
                 continue
-            local_path = os.path.join(FACES_DIR, fname)
-            blob.download_to_filename(local_path)
-            print(f"↺ Downloaded face: {fname}")
+            img_bytes = base64.b64decode(val['image'])
+            img_path = os.path.join(FACES_DIR, f"{name}.jpg")
+            with open(img_path, 'wb') as f:
+                f.write(img_bytes)
+            print(f"↺ Loaded face: {name}")
     except Exception as e:
-        print(f"⚠ Storage download failed: {e}")
+        print(f"⚠ Firebase load failed: {e}")
 
 def delete_face_from_firebase(name):
-    """Delete face image from Firebase Storage."""
-    if not storage_bucket:
+    """Remove face from Firebase Realtime Database."""
+    if not firebase_ref:
         return
     try:
-        blob = storage_bucket.blob(f"faces/{name}.jpg")
-        blob.delete()
-        print(f"✓ Deleted {name} from Firebase Storage")
+        firebase_ref.child('faces_data').child(name).delete()
+        print(f"✓ Deleted {name} from Firebase DB")
     except Exception as e:
-        print(f"⚠ Storage delete failed: {e}")
+        print(f"⚠ Firebase delete failed: {e}")
 
-# ── Startup: load faces from Firebase Storage ─────────────────────────
-print("↺ Loading faces from Firebase Storage...")
-download_all_faces_from_firebase()
+# ── Startup: load faces from Firebase DB then train ───────────────────
+print("↺ Loading faces from Firebase...")
+load_faces_from_firebase()
 retrain()
 
 # ── Routes ────────────────────────────────────────────────────────────
@@ -153,8 +152,7 @@ def health():
     return jsonify({
         "status": "online",
         "registered_faces": list(name_map.keys()),
-        "firebase": "connected" if firebase_ref else "disconnected",
-        "storage": "connected" if storage_bucket else "disconnected"
+        "firebase": "connected" if firebase_ref else "disconnected"
     })
 
 @app.route("/register", methods=["POST"])
@@ -170,7 +168,6 @@ def register_face():
         if face is None:
             return jsonify({"error": "No face detected. Use a clear, well-lit photo facing the camera."}), 422
 
-        # Save to disk
         img_bytes = base64.b64decode(image_b64)
         img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
         if max(img.size) > 640:
@@ -178,10 +175,10 @@ def register_face():
         img_path = os.path.join(FACES_DIR, f"{name}.jpg")
         img.save(img_path, quality=95)
 
-        # Upload to Firebase Storage for persistence across restarts
-        upload_face_to_firebase(name, img_path)
-
+        # Save to Firebase DB for persistence across restarts
+        save_face_to_firebase(name, img_path)
         retrain()
+
         print(f"✓ Registered: {name}")
         return jsonify({"success": True, "name": name, "total": len(name_map)})
     except Exception as e:
