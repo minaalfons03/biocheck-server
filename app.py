@@ -9,16 +9,17 @@ from flask_cors import CORS
 from PIL import Image
 import cv2
 import firebase_admin
-from firebase_admin import credentials, db as firebase_db
+from firebase_admin import credentials, db as firebase_db, storage as firebase_storage
 
 app = Flask(__name__)
 CORS(app)
 
 # ── Firebase ──────────────────────────────────────────────────────────
 firebase_ref = None
+storage_bucket = None
 
 def init_firebase():
-    global firebase_ref
+    global firebase_ref, storage_bucket
     try:
         creds_json = os.environ.get("FIREBASE_CREDENTIALS", "")
         if not creds_json:
@@ -31,91 +32,119 @@ def init_firebase():
             creds_path = f.name
         cred = credentials.Certificate(creds_path)
         firebase_admin.initialize_app(cred, {
-            'databaseURL': 'https://biocheckstation-default-rtdb.firebaseio.com/'
+            'databaseURL': 'https://biocheckstation-default-rtdb.firebaseio.com/',
+            'storageBucket': 'biocheckstation.appspot.com'
         })
         firebase_ref = firebase_db.reference('/')
-        print("✓ Firebase connected")
+        storage_bucket = firebase_storage.bucket()
+        print("✓ Firebase connected (DB + Storage)")
     except Exception as e:
         print(f"✗ Firebase init error: {e}")
 
 init_firebase()
 
-# ── OpenCV face detector & recognizer ────────────────────────────────
+# ── OpenCV ────────────────────────────────────────────────────────────
 CASCADE_PATH = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
 face_cascade = cv2.CascadeClassifier(CASCADE_PATH)
-recognizer   = cv2.face.LBPHFaceRecognizer_create()
+recognizer = cv2.face.LBPHFaceRecognizer_create()
 
 FACES_DIR = "/tmp/known_faces"
 os.makedirs(FACES_DIR, exist_ok=True)
 
-# Map: label_int -> name string
-label_map = {}   # {0: "Mina", 1: "John", ...}
-name_map  = {}   # {"Mina": 0, "John": 1}
+label_map = {}  # int -> name
+name_map  = {}  # name -> int
 
 def decode_image(b64_str):
-    """Decode base64 image to OpenCV grayscale numpy array."""
     img_bytes = base64.b64decode(b64_str)
     img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-    # Resize large images
-    max_size = 640
-    if max(img.size) > max_size:
-        img.thumbnail((max_size, max_size), Image.LANCZOS)
+    if max(img.size) > 640:
+        img.thumbnail((640, 640), Image.LANCZOS)
     arr = np.array(img)
-    gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
-    return gray
+    return cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
 
-def extract_face_region(gray):
-    """Detect and return the largest face region from a grayscale image."""
+def extract_face(gray):
     faces = face_cascade.detectMultiScale(
-        gray,
-        scaleFactor=1.1,
-        minNeighbors=5,
-        minSize=(60, 60)
+        gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30)
     )
     if len(faces) == 0:
-        return None, None
-    # Pick the largest face
+        return None
     x, y, w, h = max(faces, key=lambda f: f[2] * f[3])
-    face_region = cv2.resize(gray[y:y+h, x:x+w], (200, 200))
-    return face_region, (x, y, w, h)
+    return cv2.resize(gray[y:y+h, x:x+w], (200, 200))
 
 def retrain():
-    """Retrain the LBPH recognizer from all saved face images."""
     global recognizer, label_map, name_map
-    faces_data = []
-    labels_data = []
-    label_map = {}
-    name_map = {}
-    label_counter = 0
-
+    faces_data, labels_data = [], []
+    label_map, name_map = {}, {}
+    counter = 0
     for fname in os.listdir(FACES_DIR):
         if not fname.endswith(".jpg"):
             continue
         name = fname[:-4]
-        img_path = os.path.join(FACES_DIR, fname)
-        gray = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
+        gray = cv2.imread(os.path.join(FACES_DIR, fname), cv2.IMREAD_GRAYSCALE)
         if gray is None:
             continue
-        face_region, _ = extract_face_region(gray)
-        if face_region is None:
-            print(f"⚠ No face found in stored image for {name}, skipping")
+        face = extract_face(gray)
+        if face is None:
             continue
         if name not in name_map:
-            name_map[name] = label_counter
-            label_map[label_counter] = name
-            label_counter += 1
-        faces_data.append(face_region)
+            name_map[name] = counter
+            label_map[counter] = name
+            counter += 1
+        faces_data.append(face)
         labels_data.append(name_map[name])
-
     if faces_data:
         recognizer = cv2.face.LBPHFaceRecognizer_create()
         recognizer.train(faces_data, np.array(labels_data))
-        print(f"✓ Recognizer trained on {len(faces_data)} face(s): {list(name_map.keys())}")
+        print(f"✓ Trained on {len(faces_data)} face(s): {list(name_map.keys())}")
     else:
         recognizer = cv2.face.LBPHFaceRecognizer_create()
-        print("⚠ No valid faces to train on")
+        print("⚠ No faces to train on")
 
-# Train on startup from any saved images
+def upload_face_to_firebase(name, img_path):
+    """Upload face image to Firebase Storage for persistence."""
+    if not storage_bucket:
+        return
+    try:
+        blob = storage_bucket.blob(f"faces/{name}.jpg")
+        blob.upload_from_filename(img_path, content_type='image/jpeg')
+        print(f"✓ Uploaded {name} to Firebase Storage")
+    except Exception as e:
+        print(f"⚠ Storage upload failed: {e}")
+
+def download_all_faces_from_firebase():
+    """Download all face images from Firebase Storage on startup."""
+    if not storage_bucket:
+        print("⚠ No storage bucket — skipping face download")
+        return
+    try:
+        blobs = list(storage_bucket.list_blobs(prefix="faces/"))
+        if not blobs:
+            print("⚠ No faces in Firebase Storage yet")
+            return
+        for blob in blobs:
+            fname = blob.name.replace("faces/", "")
+            if not fname.endswith(".jpg"):
+                continue
+            local_path = os.path.join(FACES_DIR, fname)
+            blob.download_to_filename(local_path)
+            print(f"↺ Downloaded face: {fname}")
+    except Exception as e:
+        print(f"⚠ Storage download failed: {e}")
+
+def delete_face_from_firebase(name):
+    """Delete face image from Firebase Storage."""
+    if not storage_bucket:
+        return
+    try:
+        blob = storage_bucket.blob(f"faces/{name}.jpg")
+        blob.delete()
+        print(f"✓ Deleted {name} from Firebase Storage")
+    except Exception as e:
+        print(f"⚠ Storage delete failed: {e}")
+
+# ── Startup: load faces from Firebase Storage ─────────────────────────
+print("↺ Loading faces from Firebase Storage...")
+download_all_faces_from_firebase()
 retrain()
 
 # ── Routes ────────────────────────────────────────────────────────────
@@ -124,7 +153,8 @@ def health():
     return jsonify({
         "status": "online",
         "registered_faces": list(name_map.keys()),
-        "firebase": "connected" if firebase_ref else "disconnected"
+        "firebase": "connected" if firebase_ref else "disconnected",
+        "storage": "connected" if storage_bucket else "disconnected"
     })
 
 @app.route("/register", methods=["POST"])
@@ -136,22 +166,22 @@ def register_face():
         return jsonify({"error": "name and image required"}), 400
     try:
         gray = decode_image(image_b64)
-        face_region, bbox = extract_face_region(gray)
-        if face_region is None:
+        face = extract_face(gray)
+        if face is None:
             return jsonify({"error": "No face detected. Use a clear, well-lit photo facing the camera."}), 422
 
-        # Save original image to disk
+        # Save to disk
         img_bytes = base64.b64decode(image_b64)
         img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-        max_size = 640
-        if max(img.size) > max_size:
-            img.thumbnail((max_size, max_size), Image.LANCZOS)
+        if max(img.size) > 640:
+            img.thumbnail((640, 640), Image.LANCZOS)
         img_path = os.path.join(FACES_DIR, f"{name}.jpg")
         img.save(img_path, quality=95)
 
-        # Retrain recognizer with new face included
-        retrain()
+        # Upload to Firebase Storage for persistence across restarts
+        upload_face_to_firebase(name, img_path)
 
+        retrain()
         print(f"✓ Registered: {name}")
         return jsonify({"success": True, "name": name, "total": len(name_map)})
     except Exception as e:
@@ -168,32 +198,24 @@ def recognise_face():
         return jsonify({"name": None, "faces_found": 0, "message": "No faces registered yet"})
     try:
         gray = decode_image(image_b64)
-        face_region, bbox = extract_face_region(gray)
-
-        if face_region is None:
+        face = extract_face(gray)
+        if face is None:
             return jsonify({"name": None, "faces_found": 0, "confidence": 0})
 
-        label, distance = recognizer.predict(face_region)
-        # LBPH distance: lower = better match. < 80 is a strong match, < 100 is acceptable
-        confidence = max(0, round((100 - distance) / 100, 3))
-        matched_name = label_map.get(label, "Unknown")
-
-        print(f"→ Predicted: {matched_name} | distance={distance:.1f} | confidence={confidence}")
+        label, distance = recognizer.predict(face)
+        name = label_map.get(label, "Unknown")
+        confidence = round(max(0, (100 - distance) / 100), 3)
+        print(f"→ {name} | distance={distance:.1f} | confidence={confidence}")
 
         if distance > 100:
-            # Too uncertain, treat as unknown
-            matched_name = "Unknown"
+            name = "Unknown"
             confidence = 0
 
-        if matched_name != "Unknown" and firebase_ref:
-            firebase_ref.child("current_user").set(matched_name)
-            print(f"✓ Firebase updated: {matched_name}")
+        if name != "Unknown" and firebase_ref:
+            firebase_ref.child("current_user").set(name)
+            print(f"✓ Firebase updated: {name}")
 
-        return jsonify({
-            "name": matched_name,
-            "confidence": confidence,
-            "faces_found": 1
-        })
+        return jsonify({"name": name, "confidence": confidence, "faces_found": 1})
 
     except Exception as e:
         print(f"Recognise error: {e}")
@@ -206,12 +228,12 @@ def list_faces():
 @app.route("/faces/<name>", methods=["DELETE"])
 def delete_face(name):
     if name in name_map:
-        img_path = os.path.join(FACES_DIR, f"{name}.jpg")
         try:
-            os.remove(img_path)
+            os.remove(os.path.join(FACES_DIR, f"{name}.jpg"))
         except:
             pass
-        retrain()  # retrain without deleted face
+        delete_face_from_firebase(name)
+        retrain()
         return jsonify({"success": True, "deleted": name})
     return jsonify({"error": "Not found"}), 404
 
