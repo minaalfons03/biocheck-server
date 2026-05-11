@@ -1,6 +1,7 @@
 flask
 flask-cors
 firebase-admin
+google-cloud-storage
 opencv-contrib-python-headless
 Pillow
 numpy
